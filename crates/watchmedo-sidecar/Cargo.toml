@@ -14,4 +14,4 @@ glob = "0.3"
 tokio = { version = "1.44", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-watchmedo-probe-api = { path = "../watchmedo-probe-api" }
+watchmedo-probe = { path = "../watchmedo-probe" }

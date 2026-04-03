@@ -1,5 +1,5 @@
 [package]
-name = "watchmedo-probe-api"
+name = "watchmedo-probe"
 version = "0.1.0"
 edition = "2024"
 

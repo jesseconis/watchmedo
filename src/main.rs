@@ -3,17 +3,19 @@ mod input_keys;
 mod input_trace;
 mod network;
 mod protocol;
+mod shell_history;
 mod state;
 mod web;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context;
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 use protocol::{HistoryRequest, NodeMetadata};
 use state::TelemetryStore;
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
+use watchmedo_probe::{InputTracePreset, ProbeModuleConfig, ProbeModuleId};
 
 #[derive(Debug, Clone, Parser)]
 #[command(author, version, about = "Desktop telemetry node for watchmedo")]
@@ -26,26 +28,6 @@ struct Cli {
 enum Command {
     Serve(ServeArgs),
     Watch(WatchArgs),
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum InputTracePreset {
-    BpftraceInputEvent,
-}
-
-impl InputTracePreset {
-    fn command(self) -> (String, Vec<String>) {
-        match self {
-            Self::BpftraceInputEvent => (
-                "bpftrace".to_owned(),
-                vec![
-                    "-e".to_owned(),
-                    "kprobe:input_event { printf(\"dev_ptr=%p type=%u code=%u value=%d\\n\", arg0, arg1, arg2, arg3); }"
-                        .to_owned(),
-                ],
-            ),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -71,8 +53,8 @@ struct ServeArgs {
     #[arg(
         long,
         conflicts_with_all = ["input_trace_preset", "input_trace_program", "input_trace_arg"],
-        help = "Unix socket path for a privileged keyboard trace sidecar",
-        long_help = "Unix socket path for a privileged keyboard trace sidecar. This is the safer deployment option because watchmedo serve can stay unprivileged while a separate sidecar process with root or caps connects and forwards raw input_event trace lines over IPC."
+        help = "Unix socket path for a privileged probe sidecar",
+        long_help = "Unix socket path for a privileged probe sidecar. This is the safer deployment option because watchmedo serve can stay unprivileged while a separate sidecar process with root or BPF capabilities connects, receives the desired probe module set at runtime, and streams structured events back over IPC."
     )]
     input_trace_socket: Option<PathBuf>,
 
@@ -118,12 +100,20 @@ struct ServeArgs {
 
     #[arg(long, value_enum, help = "Filter key states emitted to the API; repeat to allow multiple of up, down, repeat")]
     input_trace_state: Vec<input_trace::KeyboardTraceStateFilter>,
+
+    #[arg(
+        long,
+        value_enum,
+        help = "Probe module to request from the sidecar; repeat to enable multiple modules such as keyboard-input or shell-commands"
+    )]
+    probe_module: Vec<ProbeModuleId>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Cli, Command, InputTracePreset};
     use clap::Parser;
+    use watchmedo_probe::ProbeModuleId;
 
     #[test]
     fn serve_accepts_hyphen_prefixed_input_trace_args() {
@@ -195,6 +185,25 @@ mod tests {
             Some(std::path::Path::new("/tmp/watchmedo-input.sock"))
         );
     }
+
+    #[test]
+    fn serve_accepts_probe_modules() {
+        let cli = Cli::try_parse_from([
+            "watchmedo",
+            "serve",
+            "--probe-module",
+            "keyboard-input",
+            "--probe-module",
+            "shell-commands",
+        ])
+        .expect("serve probe modules should parse");
+
+        let Command::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+
+        assert_eq!(args.probe_module, vec![ProbeModuleId::KeyboardInput, ProbeModuleId::ShellCommands]);
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -229,6 +238,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve(args) => {
             let sample_interval = Duration::from_millis(args.sample_interval_ms);
             let retention = Duration::from_secs(args.retention_secs);
+            let requested_probe_modules = requested_probe_modules(&args);
 
             let state = Arc::new(RwLock::new(TelemetryStore::new(
                 NodeMetadata::capture(),
@@ -251,6 +261,7 @@ async fn main() -> anyhow::Result<()> {
                     Arc::clone(&state),
                     input_trace::KeyboardTraceSocketConfig {
                         socket_path,
+                        modules: requested_probe_modules,
                         channel_capacity: args.input_trace_buffer,
                         max_batch_size: args.input_trace_batch_size,
                         flush_interval: Duration::from_millis(args.input_trace_flush_ms),
@@ -331,5 +342,17 @@ async fn main() -> anyhow::Result<()> {
             })
             .await
         }
+    }
+}
+
+fn requested_probe_modules(args: &ServeArgs) -> Vec<ProbeModuleConfig> {
+    if args.probe_module.is_empty() {
+        vec![ProbeModuleConfig::enabled(ProbeModuleId::KeyboardInput)]
+    } else {
+        args.probe_module
+            .iter()
+            .copied()
+            .map(ProbeModuleConfig::enabled)
+            .collect()
     }
 }

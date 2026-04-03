@@ -3571,11 +3571,11 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
- "watchmedo-probe-api",
+ "watchmedo-probe",
 ]
 
 [[package]]
-name = "watchmedo-probe-api"
+name = "watchmedo-probe"
 version = "0.1.0"
 dependencies = [
  "clap",
@@ -3594,7 +3594,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "watchmedo-probe-api",
+ "watchmedo-probe",
 ]
 
 [[package]]
