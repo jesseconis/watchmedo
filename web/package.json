@@ -1,0 +1,31 @@
+{
+  "name": "watchmedo-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@chainsafe/libp2p-noise": "^17.0.0",
+    "@chainsafe/libp2p-yamux": "^8.0.1",
+    "@fontsource/ibm-plex-mono": "^5.1.1",
+    "@fontsource/space-grotesk": "^5.1.0",
+    "@libp2p/circuit-relay-v2": "^4.1.7",
+    "@libp2p/identify": "^4.0.14",
+    "@libp2p/websockets": "^10.1.7",
+    "@multiformats/multiaddr": "^13.0.1",
+    "libp2p": "^3.1.7",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  }
+}
