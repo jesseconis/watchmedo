@@ -15,7 +15,7 @@ publish = false
 [package]
 name = "watchmedo"
 description = "ebpf probe loader & collector for o11y (and fun 😁)"  
-version = "0.1.1"
+version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "github.com/jesseconis/watchmedo"
