@@ -1,6 +1,3 @@
-name := `cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].name'`
-version := `cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version'`
-
 build:
     #!/usr/bin/env bash
     set -euo pipefail
