@@ -53,11 +53,11 @@ struct ServeArgs {
     #[arg(
         long,
         conflicts_with_all = ["input_trace_preset", "input_trace_program", "input_trace_arg"],
-        help = "Unix socket path for a privileged probe sidecar",
-        long_help = "Unix socket path for a privileged probe sidecar. This is the safer deployment option because watchmedo serve can stay unprivileged while a separate sidecar process with root or BPF capabilities connects, receives the desired probe module set at runtime, and streams structured events back over IPC."
+        help = "Creates socket at <path> and waits for a privileged sidecar to connect and stream probe events",
+        long_help = "Creates a Unix domain socket at the specified path and waits for a privileged sidecar process to connect and stream probe events. This is an alternative to using --input-trace-preset or --input-trace-program/--input-trace-arg when you want to run the tracing component separately, for example in a privileged container."
     )]
-    input_trace_socket: Option<PathBuf>,
-
+    probe_socket_path: Option<PathBuf>,
+    
     #[arg(
         long,
         value_enum,
@@ -167,11 +167,11 @@ mod tests {
     }
 
     #[test]
-    fn serve_accepts_input_trace_socket() {
+    fn serve_accepts_probe_socket_path() {
         let cli = Cli::try_parse_from([
             "watchmedo",
             "serve",
-            "--input-trace-socket",
+            "--probe-socket-path",
             "/tmp/watchmedo-input.sock",
         ])
         .expect("serve socket args should parse");
@@ -181,7 +181,7 @@ mod tests {
         };
 
         assert_eq!(
-            args.input_trace_socket.as_deref(),
+            args.probe_socket_path.as_deref(),
             Some(std::path::Path::new("/tmp/watchmedo-input.sock"))
         );
     }
@@ -256,7 +256,7 @@ async fn main() -> anyhow::Result<()> {
             )
             .context("failed to start telemetry collector")?;
 
-            let keyboard_trace = if let Some(socket_path) = args.input_trace_socket.clone() {
+            let keyboard_trace = if let Some(socket_path) = args.probe_socket_path.clone() {
                 Some(input_trace::spawn_keyboard_trace_socket_service(
                     Arc::clone(&state),
                     input_trace::KeyboardTraceSocketConfig {

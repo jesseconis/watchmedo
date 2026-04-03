@@ -25,8 +25,8 @@ use watchmedo_probe::{
 struct Cli {
     #[arg(
         long,
-        help = "Unix socket path exposed by 'watchmedo serve --input-trace-socket ...'",
-        long_help = "Unix socket path exposed by 'watchmedo serve --input-trace-socket ...'. The sidecar connects to this socket, receives the runtime probe configuration from watchmedo serve, and streams structured probe events back over the same IPC channel."
+        help = "Unix socket path exposed by 'watchmedo serve --probe-socket ...'",
+        long_help = "Unix socket path exposed by 'watchmedo serve --probe-socket ...'. The sidecar connects to this socket, receives the runtime probe configuration from watchmedo serve, and streams structured probe events back over the same IPC channel."
     )]
     socket_path: PathBuf,
 
