@@ -19,7 +19,8 @@ use crate::{
     input_keys::KeyboardHistoryResponse,
     input_trace::{KeyboardTraceHandle, KeyboardTraceStatusSnapshot},
     protocol::{HistoryRequest, LiveTelemetryEvent},
-    state::{KeyboardStoreStatusSnapshot, TelemetryStore},
+    shell_history::ShellHistoryResponse,
+    state::{KeyboardStoreStatusSnapshot, ShellStoreStatusSnapshot, TelemetryStore},
 };
 
 #[derive(Debug, Clone)]
@@ -41,6 +42,12 @@ struct KeyboardStatusResponse {
     store: KeyboardStoreStatusSnapshot,
 }
 
+#[derive(Debug, serde::Serialize)]
+struct ShellStatusResponse {
+    timestamp_ms: u64,
+    store: ShellStoreStatusSnapshot,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HistoryQuery {
@@ -52,6 +59,13 @@ struct HistoryQuery {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct KeyboardHistoryQuery {
+    lookback_secs: Option<u64>,
+    max_events: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShellHistoryQuery {
     lookback_secs: Option<u64>,
     max_events: Option<usize>,
 }
@@ -69,6 +83,9 @@ pub async fn run(state: Arc<RwLock<TelemetryStore>>, config: WebConfig) -> anyho
         .route("/api/keyboard/history", get(keyboard_history_handler))
         .route("/api/keyboard/live", get(keyboard_live_handler))
         .route("/api/keyboard/status", get(keyboard_status_handler))
+        .route("/api/shell/history", get(shell_history_handler))
+        .route("/api/shell/live", get(shell_live_handler))
+        .route("/api/shell/status", get(shell_status_handler))
         .with_state(WebState {
             store: state,
             keyboard_trace,
@@ -246,6 +263,78 @@ async fn keyboard_status_handler(State(state): State<WebState>) -> Json<Keyboard
     Json(KeyboardStatusResponse {
         timestamp_ms: now_ms(),
         trace,
+        store,
+    })
+}
+
+async fn shell_history_handler(
+    State(state): State<WebState>,
+    Query(query): Query<ShellHistoryQuery>,
+) -> Json<ShellHistoryResponse> {
+    let response = {
+        let guard = state.store.read().await;
+        guard.build_shell_history_response(query.lookback_secs, query.max_events, now_ms())
+    };
+
+    Json(response)
+}
+
+async fn shell_live_handler(
+    State(state): State<WebState>,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let mut receiver = {
+        let guard = state.store.read().await;
+        guard.subscribe_shell_live()
+    };
+
+    let event_stream = stream! {
+        yield Ok(
+            Event::default()
+                .event("ready")
+                .data("connected")
+        );
+
+        loop {
+            match receiver.recv().await {
+                Ok(batch) => {
+                    match serde_json::to_string(&batch) {
+                        Ok(json) => {
+                            yield Ok(
+                                Event::default()
+                                    .event("shell")
+                                    .data(json)
+                            );
+                        }
+                        Err(error) => {
+                            warn!(?error, "failed to serialize shell batch for web api");
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "web api shell stream lagged behind the shell trace pipeline");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    break;
+                }
+            }
+        }
+    };
+
+    Sse::new(event_stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(5))
+            .text("keepalive"),
+    )
+}
+
+async fn shell_status_handler(State(state): State<WebState>) -> Json<ShellStatusResponse> {
+    let store = {
+        let guard = state.store.read().await;
+        guard.build_shell_status_snapshot()
+    };
+
+    Json(ShellStatusResponse {
+        timestamp_ms: now_ms(),
         store,
     })
 }

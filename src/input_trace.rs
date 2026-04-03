@@ -20,9 +20,15 @@ use tokio::{
     time::{self, MissedTickBehavior},
 };
 use tracing::{debug, info, warn};
+use watchmedo_probe::{
+    KeyboardRawEventPayload, ModuleState, ProbeEventPayload, ProbeModuleConfig, ProbeModuleId,
+    SIDECAR_PROTOCOL_VERSION, ServerMessage, SidecarMessage, parse_bpftrace_input_event_line,
+    read_frame, write_frame,
+};
 
 use crate::{
     input_keys::{KeyState, KeyboardEventDecoder, KeyboardKeyEvent, PendingKeyboardEvent, RawInputEvent},
+    shell_history::PendingShellCommandEvent,
     state::TelemetryStore,
 };
 
@@ -154,6 +160,7 @@ pub struct KeyboardTraceConfig {
 #[derive(Debug, Clone)]
 pub struct KeyboardTraceSocketConfig {
     pub socket_path: PathBuf,
+    pub modules: Vec<ProbeModuleConfig>,
     pub channel_capacity: usize,
     pub max_batch_size: usize,
     pub flush_interval: Duration,
@@ -398,6 +405,7 @@ pub fn spawn_keyboard_trace_socket_service(
 
     let normalized_config = KeyboardTraceSocketConfig {
         socket_path: config.socket_path,
+        modules: config.modules,
         channel_capacity,
         max_batch_size,
         flush_interval,
@@ -415,6 +423,7 @@ pub fn spawn_keyboard_trace_socket_service(
     };
 
     tokio::spawn(run_socket_trace_reader(
+        Arc::clone(&state),
         normalized_config,
         sender,
         Arc::clone(&pending_dropped_events),
@@ -526,6 +535,7 @@ async fn run_command_trace_reader_inner(
 }
 
 async fn run_socket_trace_reader(
+    state: Arc<RwLock<TelemetryStore>>,
     config: KeyboardTraceSocketConfig,
     sender: mpsc::Sender<TraceInputEvent>,
     pending_dropped_events: Arc<AtomicU64>,
@@ -555,8 +565,27 @@ async fn run_socket_trace_reader(
             Ok((stream, _)) => {
                 runtime.mark_running().await;
 
-                let read_result = read_trace_lines(
-                    BufReader::new(stream).lines(),
+                let (mut reader, mut writer) = stream.into_split();
+                if let Err(error) = write_frame(
+                    &mut writer,
+                    &ServerMessage::configure(config.modules.clone()),
+                )
+                .await
+                {
+                    if sender.is_closed() {
+                        runtime.mark_stopped(None, Some(error.to_string())).await;
+                        break;
+                    }
+
+                    runtime.restart_count.fetch_add(1, Ordering::Relaxed);
+                    runtime.mark_backoff(None, Some(error.to_string())).await;
+                    time::sleep(config.restart_backoff).await;
+                    continue;
+                }
+
+                let read_result = read_sidecar_messages(
+                    &state,
+                    &mut reader,
                     &sender,
                     &pending_dropped_events,
                     Arc::clone(&runtime),
@@ -616,28 +645,14 @@ where
     while let Some(line) = lines.next_line().await? {
         runtime.total_lines_seen.fetch_add(1, Ordering::Relaxed);
 
-        match parse_bpftrace_line(&line) {
-            Ok(Some(event)) => {
-                if !filter.matches_device(event.device_ptr.as_deref()) {
-                    runtime.total_filtered_events.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-
-                match sender.try_send(event) {
-                    Ok(()) => {
-                        runtime.queue_depth.fetch_add(1, Ordering::Relaxed);
-                        runtime.total_enqueued_events.fetch_add(1, Ordering::Relaxed);
-                        runtime.last_event_at_ms.store(now_ms(), Ordering::Relaxed);
-                    }
-                    Err(TrySendError::Full(_)) => {
-                        pending_dropped_events.fetch_add(1, Ordering::Relaxed);
-                        runtime.total_dropped_events.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(TrySendError::Closed(_)) => {
-                        anyhow::bail!("keyboard trace processor closed");
-                    }
-                }
-            }
+        match parse_bpftrace_input_event_line(&line) {
+            Ok(Some(payload)) => enqueue_trace_event(
+                trace_input_event_from_payload(payload),
+                sender,
+                pending_dropped_events,
+                runtime.as_ref(),
+                filter,
+            )?,
             Ok(None) => {
                 runtime.total_non_event_lines.fetch_add(1, Ordering::Relaxed);
             }
@@ -645,6 +660,131 @@ where
                 runtime.total_parse_errors.fetch_add(1, Ordering::Relaxed);
                 debug!(reason, %line, "failed to parse keyboard trace line");
             }
+        }
+    }
+
+    Ok(())
+}
+
+async fn read_sidecar_messages<R>(
+    state: &Arc<RwLock<TelemetryStore>>,
+    reader: &mut R,
+    sender: &mpsc::Sender<TraceInputEvent>,
+    pending_dropped_events: &AtomicU64,
+    runtime: Arc<KeyboardTraceRuntime>,
+    filter: &KeyboardTraceFilter,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    while let Some(message) = read_frame::<_, SidecarMessage>(reader)
+        .await
+        .context("failed to read sidecar frame")?
+    {
+        runtime.total_lines_seen.fetch_add(1, Ordering::Relaxed);
+
+        match message {
+            SidecarMessage::Status {
+                protocol_version,
+                modules,
+            } => {
+                if protocol_version != SIDECAR_PROTOCOL_VERSION {
+                    anyhow::bail!(
+                        "unsupported sidecar protocol version {protocol_version}, expected {}",
+                        SIDECAR_PROTOCOL_VERSION
+                    );
+                }
+
+                runtime.total_non_event_lines.fetch_add(1, Ordering::Relaxed);
+                log_sidecar_module_statuses(&modules);
+            }
+            SidecarMessage::Event {
+                protocol_version,
+                event,
+            } => {
+                if protocol_version != SIDECAR_PROTOCOL_VERSION {
+                    anyhow::bail!(
+                        "unsupported sidecar protocol version {protocol_version}, expected {}",
+                        SIDECAR_PROTOCOL_VERSION
+                    );
+                }
+
+                match (event.module, event.payload) {
+                    (ProbeModuleId::KeyboardInput, ProbeEventPayload::KeyboardRawInput(payload)) => {
+                        enqueue_trace_event(
+                            trace_input_event_from_payload(payload),
+                            sender,
+                            pending_dropped_events,
+                            runtime.as_ref(),
+                            filter,
+                        )?;
+                    }
+                    (ProbeModuleId::ShellCommands, ProbeEventPayload::ShellCommand(payload)) => {
+                        runtime.last_event_at_ms.store(event.captured_at_ms, Ordering::Relaxed);
+                        runtime.total_published_events.fetch_add(1, Ordering::Relaxed);
+
+                        let mut guard = state.write().await;
+                        guard.insert_shell_event(PendingShellCommandEvent {
+                            captured_at_ms: event.captured_at_ms,
+                            pid: payload.pid,
+                            uid: payload.uid,
+                            command: payload.command,
+                            executable: payload.executable,
+                        });
+                    }
+                    (module, ProbeEventPayload::Json(_)) => {
+                        runtime.total_non_event_lines.fetch_add(1, Ordering::Relaxed);
+                        debug!(?module, event_name = %event.event_name, "ignored non-keyboard probe event on keyboard trace socket");
+                    }
+                    (module, _) => {
+                        runtime.total_non_event_lines.fetch_add(1, Ordering::Relaxed);
+                        debug!(?module, event_name = %event.event_name, "ignored mismatched probe event on keyboard trace socket");
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn log_sidecar_module_statuses(statuses: &[watchmedo_probe::ModuleStatus]) {
+    for status in statuses {
+        match status.state {
+            ModuleState::Unsupported | ModuleState::Failed => {
+                warn!(?status.module, ?status.state, detail = ?status.detail, "sidecar module status")
+            }
+            ModuleState::Starting | ModuleState::Running | ModuleState::Stopped => {
+                info!(?status.module, ?status.state, detail = ?status.detail, "sidecar module status")
+            }
+        }
+    }
+}
+
+fn enqueue_trace_event(
+    event: TraceInputEvent,
+    sender: &mpsc::Sender<TraceInputEvent>,
+    pending_dropped_events: &AtomicU64,
+    runtime: &KeyboardTraceRuntime,
+    filter: &KeyboardTraceFilter,
+) -> anyhow::Result<()> {
+    if !filter.matches_device(event.device_ptr.as_deref()) {
+        runtime.total_filtered_events.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    }
+
+    match sender.try_send(event) {
+        Ok(()) => {
+            runtime.queue_depth.fetch_add(1, Ordering::Relaxed);
+            runtime.total_enqueued_events.fetch_add(1, Ordering::Relaxed);
+            runtime.last_event_at_ms.store(now_ms(), Ordering::Relaxed);
+        }
+        Err(TrySendError::Full(_)) => {
+            pending_dropped_events.fetch_add(1, Ordering::Relaxed);
+            runtime.total_dropped_events.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(TrySendError::Closed(_)) => {
+            anyhow::bail!("keyboard trace processor closed");
         }
     }
 
@@ -743,35 +883,11 @@ fn bind_trace_socket(path: &Path) -> anyhow::Result<UnixListener> {
         .with_context(|| format!("failed to bind keyboard trace socket {}", path.display()))
 }
 
-fn parse_bpftrace_line(line: &str) -> Result<Option<TraceInputEvent>, &'static str> {
-    let Some(marker) = line.find("dev_ptr=") else {
-        return Ok(None);
-    };
-
-    let payload = &line[marker..];
-    let device_ptr = parse_field(payload, "dev_ptr")?.to_owned();
-    let event_type = parse_field(payload, "type")?
-        .parse::<u16>()
-        .map_err(|_| "invalid type field")?;
-    let code = parse_field(payload, "code")?
-        .parse::<u16>()
-        .map_err(|_| "invalid code field")?;
-    let value = parse_field(payload, "value")?
-        .parse::<i32>()
-        .map_err(|_| "invalid value field")?;
-
-    Ok(Some(TraceInputEvent {
-        device_ptr: Some(device_ptr),
-        raw_event: RawInputEvent::new(event_type, code, value),
-    }))
-}
-
-fn parse_field<'a>(payload: &'a str, key: &str) -> Result<&'a str, &'static str> {
-    let token = format!("{key}=");
-    let start = payload.find(&token).ok_or("missing field")? + token.len();
-    let rest = &payload[start..];
-
-    rest.split_whitespace().next().ok_or("missing field value")
+fn trace_input_event_from_payload(payload: KeyboardRawEventPayload) -> TraceInputEvent {
+    TraceInputEvent {
+        device_ptr: payload.device_ptr,
+        raw_event: RawInputEvent::new(payload.event_type, payload.code, payload.value),
+    }
 }
 
 fn load_optional_atomic(value: &AtomicU64) -> Option<u64> {
@@ -795,14 +911,17 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{KeyboardTraceFilter, KeyboardTraceStateFilter, parse_bpftrace_line};
+    use super::{KeyboardTraceFilter, KeyboardTraceStateFilter, trace_input_event_from_payload};
     use crate::input_keys::{KeyState, KeyboardKeyEvent, Modifiers};
+    use watchmedo_probe::{KeyboardRawEventPayload, parse_bpftrace_input_event_line};
 
     #[test]
     fn parses_plain_bpftrace_lines() {
-        let parsed = parse_bpftrace_line("dev_ptr=0xffff894a62670000 type=1 code=20 value=1")
-            .expect("expected valid parse result")
-            .expect("expected parsed trace line");
+        let parsed = trace_input_event_from_payload(
+            parse_bpftrace_input_event_line("dev_ptr=0xffff894a62670000 type=1 code=20 value=1")
+                .expect("expected valid parse result")
+                .expect("expected parsed trace line"),
+        );
 
         assert_eq!(parsed.device_ptr.as_deref(), Some("0xffff894a62670000"));
         assert_eq!(parsed.raw_event.event_type, 1);
@@ -812,17 +931,19 @@ mod tests {
 
     #[test]
     fn ignores_tty_prefix_noise_before_dev_ptr_marker() {
-        let parsed = parse_bpftrace_line("tdev_ptr=0xffff894a62670000 type=1 code=20 value=1")
+        let parsed = parse_bpftrace_input_event_line("tdev_ptr=0xffff894a62670000 type=1 code=20 value=1")
             .expect("expected valid parse result")
             .expect("expected parsed trace line");
 
-        assert_eq!(parsed.device_ptr.as_deref(), Some("0xffff894a62670000"));
-        assert_eq!(parsed.raw_event.code, 20);
+        assert_eq!(
+            parsed,
+            KeyboardRawEventPayload::new(Some("0xffff894a62670000".to_owned()), 1, 20, 1)
+        );
     }
 
     #[test]
     fn rejects_non_matching_lines() {
-        assert!(parse_bpftrace_line("Attached 1 probe")
+        assert!(parse_bpftrace_input_event_line("Attached 1 probe")
             .expect("expected ignored line")
             .is_none());
     }

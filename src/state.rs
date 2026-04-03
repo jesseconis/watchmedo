@@ -6,16 +6,29 @@ use tokio::sync::broadcast;
 use crate::{
     input_keys::{KeyboardEventBatch, KeyboardHistoryResponse, KeyboardInputEvent, PendingKeyboardEvent},
     protocol::{CollectedTelemetry, HistoryRequest, HistoryResponse, NodeMetadata, ProcessSummary, SystemSample},
+    shell_history::{PendingShellCommandEvent, ShellCommandBatch, ShellCommandEvent, ShellHistoryResponse},
 };
 
 const LIVE_CHANNEL_CAPACITY: usize = 256;
 const KEYBOARD_LIVE_CHANNEL_CAPACITY: usize = 256;
 const MIN_KEYBOARD_HISTORY_CAPACITY: usize = 1_024;
+const SHELL_LIVE_CHANNEL_CAPACITY: usize = 256;
+const MIN_SHELL_HISTORY_CAPACITY: usize = 512;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct KeyboardStoreStatusSnapshot {
     pub retained_events: usize,
     pub dropped_events: u64,
+    pub max_events: usize,
+    pub next_sequence: u64,
+    pub oldest_event_at_ms: Option<u64>,
+    pub newest_event_at_ms: Option<u64>,
+    pub live_subscribers: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ShellStoreStatusSnapshot {
+    pub retained_events: usize,
     pub max_events: usize,
     pub next_sequence: u64,
     pub oldest_event_at_ms: Option<u64>,
@@ -37,6 +50,10 @@ pub struct TelemetryStore {
     keyboard_dropped_events: u64,
     keyboard_max_events: usize,
     keyboard_live_sender: broadcast::Sender<KeyboardEventBatch>,
+    next_shell_sequence: u64,
+    shell_events: VecDeque<ShellCommandEvent>,
+    shell_max_events: usize,
+    shell_live_sender: broadcast::Sender<ShellCommandBatch>,
 }
 
 impl TelemetryStore {
@@ -48,7 +65,9 @@ impl TelemetryStore {
     ) -> Self {
         let (live_sender, _) = broadcast::channel(LIVE_CHANNEL_CAPACITY);
         let (keyboard_live_sender, _) = broadcast::channel(KEYBOARD_LIVE_CHANNEL_CAPACITY);
+        let (shell_live_sender, _) = broadcast::channel(SHELL_LIVE_CHANNEL_CAPACITY);
         let keyboard_max_events = max_samples.saturating_mul(64).max(MIN_KEYBOARD_HISTORY_CAPACITY);
+        let shell_max_events = max_samples.saturating_mul(24).max(MIN_SHELL_HISTORY_CAPACITY);
 
         Self {
             node,
@@ -64,6 +83,10 @@ impl TelemetryStore {
             keyboard_dropped_events: 0,
             keyboard_max_events,
             keyboard_live_sender,
+            next_shell_sequence: 1,
+            shell_events: VecDeque::new(),
+            shell_max_events,
+            shell_live_sender,
         }
     }
 
@@ -122,6 +145,31 @@ impl TelemetryStore {
         self.keyboard_live_sender.subscribe()
     }
 
+    pub fn insert_shell_event(&mut self, event: PendingShellCommandEvent) {
+        let published_at_ms = event.captured_at_ms;
+        let stored = ShellCommandEvent {
+            sequence: self.next_shell_sequence,
+            captured_at_ms: event.captured_at_ms,
+            pid: event.pid,
+            uid: event.uid,
+            command: event.command,
+            executable: event.executable,
+        };
+
+        self.next_shell_sequence += 1;
+        self.shell_events.push_back(stored.clone());
+        self.prune_shell();
+
+        let _ = self.shell_live_sender.send(ShellCommandBatch {
+            published_at_ms,
+            events: vec![stored],
+        });
+    }
+
+    pub fn subscribe_shell_live(&self) -> broadcast::Receiver<ShellCommandBatch> {
+        self.shell_live_sender.subscribe()
+    }
+
     pub fn build_keyboard_history_response(
         &self,
         lookback_secs: Option<u64>,
@@ -160,6 +208,45 @@ impl TelemetryStore {
             oldest_event_at_ms: self.keyboard_events.front().map(|event| event.captured_at_ms),
             newest_event_at_ms: self.keyboard_events.back().map(|event| event.captured_at_ms),
             live_subscribers: self.keyboard_live_sender.receiver_count(),
+        }
+    }
+
+    pub fn build_shell_history_response(
+        &self,
+        lookback_secs: Option<u64>,
+        limit: Option<usize>,
+        now_ms: u64,
+    ) -> ShellHistoryResponse {
+        let lookback_ms = lookback_secs.map(|secs| secs.saturating_mul(1_000));
+        let earliest_ms = lookback_ms.map(|delta| now_ms.saturating_sub(delta));
+
+        let mut events = self
+            .shell_events
+            .iter()
+            .filter(|event| earliest_ms.is_none_or(|cutoff| event.captured_at_ms >= cutoff))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if let Some(limit) = limit {
+            let keep_from = events.len().saturating_sub(limit);
+            events = events.split_off(keep_from);
+        }
+
+        ShellHistoryResponse {
+            generated_at_ms: now_ms,
+            retention_secs: self.retention.as_secs(),
+            events,
+        }
+    }
+
+    pub fn build_shell_status_snapshot(&self) -> ShellStoreStatusSnapshot {
+        ShellStoreStatusSnapshot {
+            retained_events: self.shell_events.len(),
+            max_events: self.shell_max_events,
+            next_sequence: self.next_shell_sequence,
+            oldest_event_at_ms: self.shell_events.front().map(|event| event.captured_at_ms),
+            newest_event_at_ms: self.shell_events.back().map(|event| event.captured_at_ms),
+            live_subscribers: self.shell_live_sender.receiver_count(),
         }
     }
 
@@ -224,6 +311,23 @@ impl TelemetryStore {
             }
         }
     }
+
+    fn prune_shell(&mut self) {
+        while self.shell_events.len() > self.shell_max_events {
+            self.shell_events.pop_front();
+        }
+
+        if let Some(latest) = self.shell_events.back().map(|event| event.captured_at_ms) {
+            let cutoff = latest.saturating_sub(self.retention.as_millis() as u64);
+            while self
+                .shell_events
+                .front()
+                .is_some_and(|event| event.captured_at_ms < cutoff)
+            {
+                self.shell_events.pop_front();
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -232,6 +336,7 @@ mod tests {
     use crate::{
         input_keys::{KeyboardKeyEvent, KeyState, Modifiers, PendingKeyboardEvent},
         protocol::{CollectedTelemetry, HistoryRequest, NodeMetadata, SystemSample},
+        shell_history::PendingShellCommandEvent,
     };
     use std::time::Duration;
 
@@ -373,5 +478,45 @@ mod tests {
         assert_eq!(history.dropped_events, 2);
         assert_eq!(history.events.len(), 1);
         assert_eq!(history.events[0].key.key_name, "KEY_T");
+    }
+
+    #[test]
+    fn stores_shell_history_and_live_streams() {
+        let mut store = TelemetryStore::new(
+            NodeMetadata {
+                host_name: None,
+                system_name: None,
+                os_version: None,
+                kernel_version: None,
+                cpu_count: 1,
+                physical_core_count: Some(1),
+            },
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            3,
+        );
+
+        let mut receiver = store.subscribe_shell_live();
+
+        store.insert_shell_event(PendingShellCommandEvent {
+            captured_at_ms: 2_000,
+            pid: 42,
+            uid: 1000,
+            command: "echo hello".to_owned(),
+            executable: Some("echo".to_owned()),
+        });
+
+        let batch = receiver.try_recv().expect("expected shell live batch");
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].sequence, 1);
+        assert_eq!(batch.events[0].command, "echo hello");
+
+        let history = store.build_shell_history_response(None, None, 2_010);
+        assert_eq!(history.events.len(), 1);
+        assert_eq!(history.events[0].pid, 42);
+
+        let status = store.build_shell_status_snapshot();
+        assert_eq!(status.retained_events, 1);
+        assert_eq!(status.live_subscribers, 1);
     }
 }
