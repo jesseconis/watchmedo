@@ -18,3 +18,4 @@ watchmedo-probe = { path = "../watchmedo-probe" }
 
 [package.metadata.release]
 release = true
+publish = false

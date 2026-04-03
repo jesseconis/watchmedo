@@ -10,11 +10,12 @@ sign-commit = true
 sign-tag = true
 pre-release-commit-message = "chore💤: release {{crate_name}} v{{version}}"
 tag-message = "chore💤: release {{crate_name}} v{{version}}"
+publish = false
 
 [package]
 name = "watchmedo"
 description = "ebpf probe loader & collector for o11y (and fun 😁)"  
-version = "0.1.1"
+version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "github.com/jesseconis/watchmedo"
