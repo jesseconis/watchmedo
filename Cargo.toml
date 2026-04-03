@@ -5,6 +5,12 @@ members = [
 ]
 resolver = "3"
 
+[workspace.metadata.release]
+sign-commit = true
+sign-tag = true
+pre-release-commit-message = "chore💤: release {{crate_name}} v{{version}}"
+tag-message = "chore💤: release {{crate_name}} v{{version}}"
+
 [package]
 name = "watchmedo"
 description = "ebpf probe loader & collector for o11y (and fun 😁)"  
@@ -30,4 +36,4 @@ tokio = { version = "1.44", features = ["io-util", "macros", "net", "process", "
 tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-watchmedo-probe = { path = "crates/watchmedo-probe" }
+watchmedo-probe = { path = "crates/watchmedo-probe", version = "0.1.0" }
