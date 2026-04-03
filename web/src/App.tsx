@@ -137,6 +137,40 @@ type KeyboardStatusResponse = {
     store: KeyboardStoreStatusSnapshot;
 };
 
+type ShellCommandEvent = {
+    sequence: number;
+    captured_at_ms: number;
+    pid: number;
+    uid: number;
+    command: string;
+    executable: string | null;
+};
+
+type ShellCommandBatch = {
+    published_at_ms: number;
+    events: ShellCommandEvent[];
+};
+
+type ShellHistoryResponse = {
+    generated_at_ms: number;
+    retention_secs: number;
+    events: ShellCommandEvent[];
+};
+
+type ShellStoreStatusSnapshot = {
+    retained_events: number;
+    max_events: number;
+    next_sequence: number;
+    oldest_event_at_ms: number | null;
+    newest_event_at_ms: number | null;
+    live_subscribers: number;
+};
+
+type ShellStatusResponse = {
+    timestamp_ms: number;
+    store: ShellStoreStatusSnapshot;
+};
+
 type KeyDefinition = {
     code: string;
     label: string;
@@ -165,6 +199,11 @@ type KeyVisualState = {
     pulsing: boolean;
 };
 
+type ProbeDescriptor = {
+    kind: string;
+    name: string;
+};
+
 type KeyboardScene = {
     transcript: string;
     lines: TranscriptToken[][];
@@ -176,8 +215,10 @@ type KeyboardScene = {
 const API_BASE = (import.meta.env.VITE_WATCHMEDO_API_BASE as string | undefined)?.replace(/\/$/, "") ?? "";
 const HISTORY_LOOKBACK_SECS = 30;
 const KEYBOARD_LOOKBACK_SECS = 180;
+const SHELL_LOOKBACK_SECS = 1_800;
 const MAX_SAMPLES = 90;
 const MAX_KEYBOARD_EVENTS = 720;
+const MAX_SHELL_EVENTS = 320;
 const KEYBOARD_PULSE_MS = 180;
 const MAX_TRANSCRIPT_CHARS = 2800;
 const MAX_TRANSCRIPT_TOKENS = 180;
@@ -292,10 +333,16 @@ function App() {
     const [keyboardConnectionState, setKeyboardConnectionState] = useState("booting");
     const [keyboardErrorMessage, setKeyboardErrorMessage] = useState<string | null>(null);
     const [lastKeyboardAtMs, setLastKeyboardAtMs] = useState<number | null>(null);
+    const [shellCommands, setShellCommands] = useState<ShellCommandEvent[]>([]);
+    const [shellStatus, setShellStatus] = useState<ShellStatusResponse | null>(null);
+    const [shellConnectionState, setShellConnectionState] = useState("booting");
+    const [shellErrorMessage, setShellErrorMessage] = useState<string | null>(null);
+    const [lastShellAtMs, setLastShellAtMs] = useState<number | null>(null);
     const [clockMs, setClockMs] = useState(() => Date.now());
 
     const deferredSamples = useDeferredValue(samples);
     const deferredKeyboardEvents = useDeferredValue(keyboardEvents);
+    const deferredShellCommands = useDeferredValue(shellCommands);
     const currentSample = deferredSamples[deferredSamples.length - 1] ?? null;
     const keyboardScene = buildKeyboardScene(deferredKeyboardEvents, clockMs);
 
@@ -338,6 +385,45 @@ function App() {
         }
 
         void loadHistory();
+
+        return () => controller.abort();
+    }, []);
+
+    useEffect(() => {
+        const controller = new AbortController();
+
+        async function loadShellBootstrap() {
+            try {
+                const params = new URLSearchParams({
+                    lookbackSecs: String(SHELL_LOOKBACK_SECS),
+                    maxEvents: String(MAX_SHELL_EVENTS),
+                });
+
+                const [historyPayload, statusPayload] = await Promise.all([
+                    fetchJson<ShellHistoryResponse>(`${API_BASE}/api/shell/history?${params.toString()}`, controller.signal),
+                    fetchJson<ShellStatusResponse>(`${API_BASE}/api/shell/status`, controller.signal),
+                ]);
+
+                const latestShellEvent = historyPayload.events[historyPayload.events.length - 1];
+
+                startTransition(() => {
+                    setShellCommands(historyPayload.events);
+                    setShellStatus(statusPayload);
+                    setLastShellAtMs(latestShellEvent?.captured_at_ms ?? statusPayload.store.newest_event_at_ms);
+                    setShellConnectionState("armed");
+                    setShellErrorMessage(null);
+                });
+            } catch (error) {
+                if (controller.signal.aborted) {
+                    return;
+                }
+
+                setShellConnectionState("history failed");
+                setShellErrorMessage(error instanceof Error ? error.message : "failed to load shell history");
+            }
+        }
+
+        void loadShellBootstrap();
 
         return () => controller.abort();
     }, []);
@@ -421,6 +507,41 @@ function App() {
     }, []);
 
     useEffect(() => {
+        let cancelled = false;
+
+        async function loadShellStatus() {
+            try {
+                const payload = await fetchJson<ShellStatusResponse>(`${API_BASE}/api/shell/status`);
+
+                if (cancelled) {
+                    return;
+                }
+
+                startTransition(() => {
+                    setShellStatus(payload);
+                });
+            } catch (error) {
+                if (cancelled) {
+                    return;
+                }
+
+                setShellErrorMessage(error instanceof Error ? error.message : "failed to refresh shell status");
+            }
+        }
+
+        void loadShellStatus();
+
+        const timer = window.setInterval(() => {
+            void loadShellStatus();
+        }, 4000);
+
+        return () => {
+            cancelled = true;
+            window.clearInterval(timer);
+        };
+    }, []);
+
+    useEffect(() => {
         const stream = new EventSource(`${API_BASE}/api/live`);
 
         stream.addEventListener("open", () => {
@@ -493,6 +614,39 @@ function App() {
         };
     }, []);
 
+    useEffect(() => {
+        const stream = new EventSource(`${API_BASE}/api/shell/live`);
+
+        stream.addEventListener("open", () => {
+            setShellConnectionState("listening");
+            setShellErrorMessage(null);
+        });
+
+        stream.addEventListener("shell", (event) => {
+            const message = event as MessageEvent<string>;
+
+            try {
+                const payload = JSON.parse(message.data) as ShellCommandBatch;
+
+                startTransition(() => {
+                    setShellCommands((previous) => [...previous, ...payload.events].slice(-MAX_SHELL_EVENTS));
+                    setLastShellAtMs(payload.published_at_ms);
+                    setShellConnectionState("live");
+                });
+            } catch (error) {
+                setShellErrorMessage(error instanceof Error ? error.message : "failed to decode shell update");
+            }
+        });
+
+        stream.addEventListener("error", () => {
+            setShellConnectionState("reconnecting");
+        });
+
+        return () => {
+            stream.close();
+        };
+    }, []);
+
     const cpuSeries = deferredSamples.map((sample) => sample.cpu_usage_pct);
     const memorySeries = deferredSamples.map((sample) => percentage(sample.used_memory_bytes, sample.total_memory_bytes));
     const networkSeries = deferredSamples.map((sample) => sample.network_received_bytes + sample.network_transmitted_bytes);
@@ -502,6 +656,7 @@ function App() {
         : 0;
     const telemetryFreshness = lastTelemetryAtMs ? formatFreshness(lastTelemetryAtMs, clockMs) : "pending";
     const keyboardFreshness = lastKeyboardAtMs ? formatFreshness(lastKeyboardAtMs, clockMs) : "pending";
+    const shellFreshness = lastShellAtMs ? formatFreshness(lastShellAtMs, clockMs) : "pending";
     const transcriptWordCount = countWords(keyboardScene.transcript);
     const printableCount = keyboardScene.transcript.replace(/\s/g, "").length;
     const traceSource = keyboardStatus ? formatKeyboardSource(keyboardStatus.trace) : "probing";
@@ -513,6 +668,15 @@ function App() {
     const traceEnabled = keyboardStatus?.trace.enabled ?? false;
     const keyboardStatusTone = traceEnabled ? readerStateAccent(traceHealth) : "neutral";
     const compactActions = keyboardScene.actions.slice(0, 8);
+    const shellCommandsPerMinute = countRecentShellCommands(deferredShellCommands, clockMs, 60_000);
+    const topExecutable = mostExecutedBinary(deferredShellCommands);
+    const shellUniqueExecutables = uniqueExecutables(deferredShellCommands);
+    const latestShellCommands = deferredShellCommands.slice(-14).reverse();
+    const latestShellSequence = deferredShellCommands.length > 0 ? deferredShellCommands[deferredShellCommands.length - 1].sequence : 0;
+    const keyboardProbe = formatKeyboardProbe(keyboardStatus?.trace);
+    const shellProbe = formatShellProbe();
+    const keyboardProbeDetail = `${keyboardConnectionState} | ${keyboardFreshness}`;
+    const shellProbeDetail = `${shellConnectionState} | ${shellFreshness}`;
 
     return (
         <main className="shell">
@@ -522,10 +686,24 @@ function App() {
                     <h1>Lets go!!!!!</h1>
                 </div>
                 <div className="status-stack">
-                    <StatusPill label="telemetry" value={telemetryConnectionState} accent={connectionAccent(telemetryConnectionState)} />
-                    <StatusPill label="keyboard" value={keyboardConnectionState} accent={connectionAccent(keyboardConnectionState)} />
-                    <StatusPill label="trace source" value={traceSource} accent={keyboardStatusTone} />
-                    <StatusPill label="last key" value={keyboardFreshness} accent="warm" />
+                    <StatusPill
+                        label="telemetry"
+                        value={telemetryConnectionState}
+                        detail={telemetryFreshness}
+                        accent={connectionAccent(telemetryConnectionState)}
+                    />
+                    <StatusPill
+                        label={keyboardProbe.kind}
+                        value={keyboardProbe.name}
+                        detail={keyboardProbeDetail}
+                        accent={connectionAccent(keyboardConnectionState)}
+                    />
+                    <StatusPill
+                        label={shellProbe.kind}
+                        value={shellProbe.name}
+                        detail={shellProbeDetail}
+                        accent={connectionAccent(shellConnectionState)}
+                    />
                 </div>
             </section>
 
@@ -679,6 +857,70 @@ function App() {
                 </article>
             </section>
 
+            <section className="shell-command-grid">
+                <article className="panel shell-console-panel">
+                    <div className="panel-head">
+                        <div>
+                            <p className="eyebrow">shell tape</p>
+                            <h2>Live command history</h2>
+                        </div>
+                        <div className="trace-ribbon">
+                            <TraceBadge label="cpm" value={String(shellCommandsPerMinute)} tone={shellCommandsPerMinute > 0 ? "cool" : "neutral"} />
+                            <TraceBadge label="top binary" value={topExecutable} tone="neutral" />
+                            <TraceBadge label="last command" value={shellFreshness} tone="warm" />
+                        </div>
+                    </div>
+
+                    <div className="shell-summary-grid">
+                        <MetricCard label="retained" value={String(shellStatus?.store.retained_events ?? deferredShellCommands.length)} detail="commands held in local shell history" compact />
+                        <MetricCard label="unique bins" value={String(shellUniqueExecutables)} detail="distinct executables seen in the current window" compact />
+                        <MetricCard label="subscribers" value={String(shellStatus?.store.live_subscribers ?? 0)} detail="live shell SSE consumers" compact />
+                        <MetricCard label="next seq" value={String(shellStatus?.store.next_sequence ?? latestShellSequence + 1)} detail="sequence to be assigned to the next shell event" compact />
+                    </div>
+
+                    <div className="terminal-window" aria-live="polite">
+                        <div className="terminal-chrome">
+                            <span className="terminal-dot warm" />
+                            <span className="terminal-dot neutral" />
+                            <span className="terminal-dot cool" />
+                            <span className="terminal-title">zsh global history</span>
+                        </div>
+
+                        <div className="terminal-buffer">
+                            {latestShellCommands.length === 0 ? (
+                                <p className="empty-state terminal-empty">No shell commands captured yet. Enable the shell sidecar module to begin streaming zsh command history.</p>
+                            ) : (
+                                latestShellCommands.map((event) => (
+                                    <div className="terminal-row" key={event.sequence}>
+                                        <span className="terminal-time">{new Date(event.captured_at_ms).toLocaleTimeString()}</span>
+                                        <span className="terminal-meta">pid {event.pid} · uid {event.uid}</span>
+                                        <span className="terminal-prompt">%</span>
+                                        <span className="terminal-command">{event.command}</span>
+                                    </div>
+                                ))
+                            )}
+                        </div>
+                    </div>
+
+                    <div className="shell-callout-row">
+                        <div>
+                            <p className="trace-label">module selection</p>
+                            <p className="trace-value">{shellConnectionState === "booting" ? "probing" : "--probe-module shell-commands"}</p>
+                        </div>
+                        <div>
+                            <p className="trace-label">most used executable</p>
+                            <p className="trace-value">{topExecutable}</p>
+                        </div>
+                        <div>
+                            <p className="trace-label">history window</p>
+                            <p className="trace-value">{SHELL_LOOKBACK_SECS}s / {MAX_SHELL_EVENTS} events</p>
+                        </div>
+                    </div>
+
+                    {shellErrorMessage ? <p className="error-banner">{shellErrorMessage}</p> : null}
+                </article>
+            </section>
+
             <section className="overview-grid">
                 <MetricCard
                     label="CPU"
@@ -829,11 +1071,14 @@ function MetricCard(props: { label: string; value: string; detail: string; compa
     );
 }
 
-function StatusPill(props: { label: string; value: string; accent: "warm" | "cool" | "neutral" }) {
+function StatusPill(props: { label: string; value: string; detail?: string; accent: "warm" | "cool" | "neutral" }) {
     return (
         <div className={`status-pill ${props.accent}`}>
-            <span>{props.label}</span>
-            <strong>{props.value}</strong>
+            <div className="status-pill-copy">
+                <span className="status-pill-label">{props.label}</span>
+                <strong>{props.value}</strong>
+            </div>
+            {props.detail ? <span className="status-pill-detail">{props.detail}</span> : null}
         </div>
     );
 }
@@ -1309,6 +1554,73 @@ function formatKeyboardSource(trace: KeyboardTraceStatusSnapshot) {
     }
 
     return trace.source_kind;
+}
+
+function formatKeyboardProbe(trace: KeyboardTraceStatusSnapshot | null | undefined): ProbeDescriptor {
+    const parsedProbe = trace ? parseProbeDescriptor(trace.args) : null;
+
+    if (parsedProbe) {
+        return parsedProbe;
+    }
+
+    return {
+        kind: "kprobe",
+        name: "input_event",
+    };
+}
+
+function formatShellProbe(): ProbeDescriptor {
+    return {
+        kind: "uprobe",
+        name: "zleread",
+    };
+}
+
+function parseProbeDescriptor(args: string[]): ProbeDescriptor | null {
+    for (const arg of args) {
+        const match = arg.match(/\b(kprobe|uprobe|uretprobe):(?:[^:\s{}]+:)?([A-Za-z_][A-Za-z0-9_]*)/);
+
+        if (!match) {
+            continue;
+        }
+
+        return {
+            kind: match[1] === "uretprobe" ? "uprobe" : match[1],
+            name: match[2],
+        };
+    }
+
+    return null;
+}
+
+function countRecentShellCommands(events: ShellCommandEvent[], nowMs: number, windowMs: number) {
+    const cutoff = nowMs - windowMs;
+    return events.filter((event) => event.captured_at_ms >= cutoff).length;
+}
+
+function mostExecutedBinary(events: ShellCommandEvent[]) {
+    const counts = new Map<string, number>();
+
+    for (const event of events) {
+        const executable = event.executable ?? "(unknown)";
+        counts.set(executable, (counts.get(executable) ?? 0) + 1);
+    }
+
+    let winner = "none";
+    let highestCount = 0;
+
+    for (const [executable, count] of counts) {
+        if (count > highestCount) {
+            winner = executable;
+            highestCount = count;
+        }
+    }
+
+    return winner;
+}
+
+function uniqueExecutables(events: ShellCommandEvent[]) {
+    return new Set(events.map((event) => event.executable ?? event.command.split(/\s+/, 1)[0] ?? "(unknown)")).size;
 }
 
 export default App;
