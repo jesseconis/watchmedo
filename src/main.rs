@@ -6,16 +6,20 @@ mod protocol;
 mod shell_history;
 mod state;
 mod web;
+//mod cli;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, CommandFactory};
+use clap_complete::Shell;
 use protocol::{HistoryRequest, NodeMetadata};
 use state::TelemetryStore;
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 use watchmedo_probe::{InputTracePreset, ProbeModuleConfig, ProbeModuleId};
+use std::io;
+use clap_complete::{generate}; //, shells::Bash, shells::Zsh};
 
 #[derive(Debug, Clone, Parser)]
 #[command(author, version, about = "Desktop telemetry node for watchmedo")]
@@ -28,7 +32,15 @@ struct Cli {
 enum Command {
     Serve(ServeArgs),
     Watch(WatchArgs),
+    Completions(CompletionsArgs)
 }
+
+
+#[derive(Debug, Clone, Args)]
+struct CompletionsArgs {
+    shell: Shell,
+}
+
 
 #[derive(Debug, Clone, Args)]
 struct ServeArgs {
@@ -232,9 +244,9 @@ async fn main() -> anyhow::Result<()> {
         .compact()
         .init();
 
-    let cli = Cli::parse();
+     let cli = &mut Cli::parse();
 
-    match cli.command {
+    match &cli.command {
         Command::Serve(args) => {
             let sample_interval = Duration::from_millis(args.sample_interval_ms);
             let retention = Duration::from_secs(args.retention_secs);
@@ -342,7 +354,12 @@ async fn main() -> anyhow::Result<()> {
             })
             .await
         }
+        Command::Completions(args) => {
+        generate(args.shell, &mut Cli::command(), "watchmedo", &mut io::stdout());
+        Ok(())
+        }
     }
+
 }
 
 fn requested_probe_modules(args: &ServeArgs) -> Vec<ProbeModuleConfig> {

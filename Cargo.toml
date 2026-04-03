@@ -1,8 +1,5 @@
 [workspace]
-members = [
-	"crates/watchmedo-probe",
-	"crates/watchmedo-sidecar",
-]
+members = ["crates/watchmedo-probe", "crates/watchmedo-sidecar"]
 resolver = "3"
 
 [workspace.metadata.release]
@@ -13,8 +10,10 @@ tag-message = "chore💤: release {{crate_name}} v{{version}}"
 publish = false
 
 [package]
+# hello 
+# # autotests = false
 name = "watchmedo"
-description = "ebpf probe loader & collector for o11y (and fun 😁)"  
+description = "ebpf probe loader & collector for o11y (and fun 😁)"
 version = "0.1.1"
 edition = "2024"
 license = "MIT"
@@ -27,13 +26,37 @@ anyhow = "1.0"
 async-stream = "0.3"
 axum = "0.8"
 clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.6.0"
 evdev = "0.13"
 futures = "0.3"
-libp2p = { version = "0.56", features = ["gossipsub", "macros", "noise", "request-response", "serde", "tcp", "tokio", "yamux", "json"] }
+libp2p = { version = "0.56", features = [
+  "gossipsub",
+  "macros",
+  "noise",
+  "request-response",
+  "serde",
+  "tcp",
+  "tokio",
+  "yamux",
+  "json",
+] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sysinfo = { version = "0.38", default-features = false, features = ["disk", "network", "system"] }
-tokio = { version = "1.44", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+sysinfo = { version = "0.38", default-features = false, features = [
+  "disk",
+  "network",
+  "system",
+] }
+tokio = { version = "1.44", features = [
+  "io-util",
+  "macros",
+  "net",
+  "process",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+] }
 tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
