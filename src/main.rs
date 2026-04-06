@@ -235,14 +235,16 @@ struct WatchArgs {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("watchmedo=info,libp2p_swarm=warn")),
-        )
-        .with_target(false)
-        .compact()
-        .init();
+    // disabled in favor of tokio-console
+    // tracing_subscriber::fmt()
+    //     .with_env_filter(
+    //         EnvFilter::try_from_default_env()
+    //             .unwrap_or_else(|_| EnvFilter::new("watchmedo=info,libp2p_swarm=warn")),
+    //     )
+    //     .with_target(false)
+    //     .compact()
+    //     .init();
+    console_subscriber::init();
 
      let cli = &mut Cli::parse();
 
